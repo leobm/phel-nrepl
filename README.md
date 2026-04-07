@@ -12,14 +12,38 @@ An nREPL server for [Phel](https://phel-lang.org/), written in Phel itself. Allo
 
 ### As a dependency in your Phel project
 
-```bash
-composer require phel-lang/phel-nrepl
+This package is not yet published on Packagist. To install it, add the GitHub repository to your `composer.json`:
+
+```json
+{
+    "require": {
+        "phel-lang/phel-nrepl": "dev-main"
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/leobm/phel-nrepl.git"
+        }
+    ],
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
 ```
+
+Then run:
+
+```bash
+composer update
+```
+
+<!-- Once published on Packagist, this will be enough:
+composer require phel-lang/phel-nrepl
+-->
 
 ### Standalone (for development)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/leobm/phel-nrepl.git
 cd phel-nrepl
 composer install
 ```
