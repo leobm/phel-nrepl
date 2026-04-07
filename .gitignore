@@ -1,0 +1,6 @@
+/vendor/
+/data/
+composer.lock
+.calva/
+.clj-kondo/.cache
+.lsp/

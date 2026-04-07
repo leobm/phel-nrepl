@@ -1,0 +1,230 @@
+(ns PhelNrepl\Server
+  (:require phel\repl :as repl)
+  (:use Phel\Compiler\CompilerFacade)
+  (:use Phel\Compiler\Infrastructure\CompileOptions)
+  (:use Phel\Compiler\Infrastructure\GlobalEnvironmentSingleton)
+  (:use Phel\Lang\Symbol)
+  (:use Phel\Lang\Registry)
+  (:use PhelNrepl\NreplHelper)
+  (:use React\EventLoop\Loop)
+  (:use React\Socket\TcpServer)
+  (:use Rhilip\Bencode\Bencode))
+
+# Registers REPL helper functions in the user namespace
+# v0.31: get-src-dirs in phel\repl resolves src-dirs automatically via CommandFacade
+(defn- init-repl-helpers []
+  (let [env (php/:: GlobalEnvironmentSingleton (getInstance))
+        repl-ns (php/:: Symbol (create "phel\\repl"))]
+    # Make phel\repl available as alias 'repl' in the user namespace
+    (php/-> env (addRequireAlias "user" (php/:: Symbol (create "repl")) repl-ns))))
+
+# Recursively converts Phel maps/vectors to PHP arrays
+(defn- to-php [x]
+  (cond
+    (hash-map? x) (let [arr (php/array)]
+                    (foreach [k v x]
+                      (php/aset arr k (to-php v)))
+                    arr)
+    (indexed? x) (let [arr (php/array)]
+                   (foreach [v x]
+                     (php/apush arr (to-php v)))
+                   arr)
+    :else x))
+
+# Converts a value to a printable string
+(defn- result-to-string [result]
+  (cond
+    # Special handling for DateTime
+    (php/instanceof result \DateTimeInterface)
+    (php/-> result (format "Y-m-d H:i:s"))
+    
+    # Other objects
+    (php/is_object result) 
+    (let [class (php/get_class result)]
+      (if (php/method_exists result "__toString")
+        (php/-> result (__toString))
+        (str "#<" class ">")))
+    
+    :else
+    (print-str result)))
+
+# Persistent CompilerFacade for namespace context
+(def- compiler-facade (php/new CompilerFacade))
+
+# Sets the current namespace in the GlobalEnvironment
+(defn- set-current-ns [ns-name]
+  (let [env (php/:: GlobalEnvironmentSingleton (getInstance))]
+    (php/-> env (setNs ns-name))))
+
+# Checks if the code is Clojure-specific (not Phel)
+(defn- clojure-specific? [code]
+  (or (php/str_contains code "clojure.main")
+      (php/str_contains code "clojure.core")
+      (php/str_contains code "clojure.repl")
+      (php/str_contains code "nrepl.")
+      (php/str_contains code "cider.")))
+
+# Transforms REPL calls - replaces (require ... with (phel\repl/require ...
+# Uses PHP helper to avoid backslash escape issues
+(defn- transform-repl-code [code]
+  (php/:: NreplHelper (transformReplCode code)))
+
+# Extracts and manually registers require aliases
+# Pattern: (require namespace :as alias)
+(defn- register-require-alias [code ns-name]
+  (when (php/str_contains code "(require ")
+    (let [# Match: (require phel\something :as alias)
+          # Simple regex to extract namespace and alias
+          matches (php/array)
+          pattern "/\\(require\\s+(\\S+)\\s+:as\\s+(\\S+)\\)/"]
+      (when (php/preg_match pattern code matches)
+        (let [full-namespace (php/aget matches 1)
+              alias (php/aget matches 2)]
+          (println "Registering alias:" alias "for" full-namespace "in ns" ns-name)
+          (php/:: NreplHelper (registerAlias ns-name alias full-namespace)))))))
+
+# Returns the effective namespace - either from a previous (ns ...) form or the given default
+(defn- effective-ns [ns-name]
+  (let [tracked (php/:: NreplHelper (getEffectiveNs))]
+    (if (php/is_string tracked)
+      tracked
+      ns-name)))
+
+# After eval, detect (ns ...) forms and register the namespace + aliases
+(defn- handle-ns-form [code]
+  (let [ns-name (php/:: NreplHelper (extractNsName code))]
+    (when (php/is_string ns-name)
+      (println "Detected ns form, switching to namespace:" ns-name)
+      (php/:: NreplHelper (setEffectiveNs ns-name))
+      # Register all (:require ... :as ...) aliases from the ns form
+      (let [requires (php/:: NreplHelper (extractNsRequires code))]
+        (foreach [alias full-ns requires]
+          (println "Registering ns alias:" alias "for" full-ns "in" ns-name)
+          (php/:: NreplHelper (registerAlias ns-name alias full-ns)))))))
+
+(defn- evaluate [code ns-name]
+  (try
+    # Empty or nil code
+    (if (or (nil? code) (= code ""))
+      (to-php {"value" "nil" "status" ["done"]})
+      # Ignore Clojure-specific code
+      (if (clojure-specific? code)
+        (do
+          (println "Ignoring Clojure-specific code")
+          (to-php {"value" "nil" "status" ["done"]}))
+        (do
+          # Use effective namespace (from previous ns form, or default)
+          (let [eff-ns (effective-ns ns-name)]
+            (when eff-ns 
+              (set-current-ns eff-ns)
+              # Set phel\core/*ns* for require aliases (used by set-var)
+              (php/-> (php/:: Registry (getInstance))
+                      (addDefinition "phel\\core" "*ns*" eff-ns)))
+            # Transform code (require -> phel\repl/require etc.)
+            (let [transformed (transform-repl-code code)]
+              (println "Original:" code)
+              (println "Transformed:" transformed)
+              # Capture stdout (for doc, source etc.)
+              (php/ob_start)
+              (let [result (php/-> compiler-facade (eval transformed))
+                    output (php/ob_get_clean)]
+                # Detect (ns ...) forms and track namespace + aliases
+                (handle-ns-form code)
+                # Manually register alias if this was a require
+                (register-require-alias code eff-ns)
+                # If stdout output exists and value is nil: use output as value
+                (let [value-str (result-to-string result)
+                      final-value (if (and (= value-str "nil") 
+                                          (php/is_string output) 
+                                          (not (= (php/trim output) "")))
+                                   (php/trim output)
+                                   value-str)]
+                  (if (and (php/is_string output) (not (= (php/trim output) "")))
+                    (to-php {"value" final-value "out" output "ns" eff-ns "status" ["done"]})
+                    (to-php {"value" final-value "ns" eff-ns "status" ["done"]})))))))))
+    (catch \Throwable e
+      (php/ob_end_clean)
+      (to-php {"ex" (php/-> e (getMessage)) "status" ["done" "eval-error"]}))))
+
+(defn- handle-request [data connection]
+  (println "Received data:" data)
+  (let [msg (php/:: Bencode (decode data))
+        op (get msg "op")
+        id (get msg "id")
+        session (get msg "session" "default-session")
+        ns-name (get msg "ns" "user")]
+    (println "Op:" op "Id:" id "Session:" session "Ns:" ns-name)
+    (cond
+      # nREPL 'clone' - used to start a new session
+      (= op "clone")
+      (let [response (to-php {"new-session" session "id" id "status" ["done"]})
+            encoded (php/:: Bencode (encode response))]
+        (println "Sending clone response, encoded:" encoded)
+        (php/-> connection (write encoded)))
+
+      # describe - server capabilities
+      (= op "describe")
+      (let [response (to-php {"id" id 
+                              "session" session
+                              "ops" {"clone" {} "describe" {} "eval" {} "close" {} "info" {} "complete" {} "load-file" {}}
+                              "versions" {"phel" {"major" "0" "minor" "10"}}
+                              "status" ["done"]})]
+        (println "Sending describe response")
+        (php/-> connection (write (php/:: Bencode (encode response)))))
+
+      # info - symbol info (CIDER)
+      (= op "info")
+      (let [response (to-php {"id" id "session" session "status" ["done" "no-info"]})]
+        (println "Info request (not implemented)")
+        (php/-> connection (write (php/:: Bencode (encode response)))))
+
+      # complete - auto-completion (CIDER)
+      (= op "complete")
+      (let [response (to-php {"id" id "session" session "completions" [] "status" ["done"]})]
+        (println "Complete request (not implemented)")
+        (php/-> connection (write (php/:: Bencode (encode response)))))
+
+      # load-file - load and evaluate a file
+      (= op "load-file")
+      (let [file-content (get msg "file")
+            _ (println "Loading file...")
+            eval-res (evaluate file-content ns-name)
+            response (php/array_merge (to-php {"id" id "session" session}) eval-res)]
+        (php/-> connection (write (php/:: Bencode (encode response)))))
+
+      # eval - evaluate code
+      (= op "eval")
+      (let [code (get msg "code")
+            _ (println "Evaluating:" code)
+            eval-res (evaluate code ns-name)
+            response (php/array_merge (to-php {"id" id "session" session}) eval-res)]
+        (println "Sending eval response:" response)
+        (php/-> connection (write (php/:: Bencode (encode response)))))
+
+      # close - close session
+      (= op "close")
+      (let [response (to-php {"id" id "session" session "status" ["done"]})]
+        (println "Closing session")
+        (php/-> connection (write (php/:: Bencode (encode response)))))
+      
+      # Fallback for unknown ops
+      :else
+      (let [response (to-php {"id" id "session" session "status" ["done" "unknown-op"]})]
+        (println "Unknown op:" op)
+        (php/-> connection (write (php/:: Bencode (encode response))))))))
+
+(defn start-server [host port]
+  (init-repl-helpers)  # Initialize REPL helpers for the user namespace
+  (let [loop (php/:: Loop (get))]
+    (let [server (php/new TcpServer (str host ":" port) loop)]
+      (php/-> server (on "connection" 
+        (fn [connection]
+          (println "Client connected!")
+          (php/-> connection (on "data" 
+            (fn [data] (handle-request data connection)))))))
+      
+      (println (str "Phel nREPL server listening on " host ":" port))
+      (php/-> loop (run)))))
+
+# Start the server
+(start-server "127.0.0.1" 7888)

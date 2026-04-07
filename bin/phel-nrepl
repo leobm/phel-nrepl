@@ -1,0 +1,37 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+error_reporting(E_ALL & ~E_DEPRECATED);
+
+// Find the autoloader by walking up the directory tree
+// Works when run from package root, as a Composer dependency (symlinked or copied)
+$dir = __DIR__;
+$autoloader = null;
+for ($i = 0; $i < 10; $i++) {
+    $candidate = $dir . '/vendor/autoload.php';
+    if (file_exists($candidate)) {
+        // Prefer the topmost project autoloader when symlinked
+        $autoloader = realpath($candidate);
+    }
+    $parent = dirname($dir);
+    if ($parent === $dir) break;
+    $dir = $parent;
+}
+
+if ($autoloader === null) {
+    fwrite(STDERR, "Could not find Composer autoloader. Run 'composer install' first.\n");
+    exit(1);
+}
+
+require $autoloader;
+
+// Determine the project root (where composer.json lives)
+$projectRoot = dirname($autoloader, 2);
+
+use Gacela\Framework\Gacela;
+use Phel\Phel;
+
+Gacela::bootstrap($projectRoot, Phel::configFn());
+Phel::run($projectRoot, 'PhelNrepl\Server');

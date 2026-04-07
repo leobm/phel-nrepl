@@ -1,0 +1,2 @@
+  {:output {:exclude-files [".*\\.phel$"]}
+   :config-in-glob {"*.phel" {:linters {:all {:level :off}}}}}

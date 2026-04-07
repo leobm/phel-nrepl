@@ -1,0 +1,28 @@
+(ns test
+  (:require phel\json :as json))
+
+(+ 1 1)
+
+(* 10 10)
+
+(+ 2 21)
+
+(def d (php/new \DateTime))
+(php/-> d (getTimestamp))
+
+(php/new \DateTime)
+
+
+(php/strlen "test")
+
+# JSON mit Phel
+(require phel\json :as json)
+(json/decode "{\"a\": 1, \"b\": 2}")
+
+(phel\json/decode "{\"a\": 1, \"b\": 2}")
+(doc filter)
+(source filter)
+
+
+;; killt rprocess für port
+;lsof -ti:7888 | xargs kill -9 2>/dev/null; sleep 1
