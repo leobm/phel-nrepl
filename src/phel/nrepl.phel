@@ -18,19 +18,6 @@
     # Make phel\repl available as alias 'repl' in the user namespace
     (php/-> env (addRequireAlias "user" (php/:: Symbol (create "repl")) repl-ns))))
 
-# Recursively converts Phel maps/vectors to PHP arrays
-(defn- to-php [x]
-  (cond
-    (hash-map? x) (let [arr (php/array)]
-                    (foreach [k v x]
-                      (php/aset arr k (to-php v)))
-                    arr)
-    (indexed? x) (let [arr (php/array)]
-                   (foreach [v x]
-                     (php/apush arr (to-php v)))
-                   arr)
-    :else x))
-
 # Converts a value to a printable string
 (defn- result-to-string [result]
   (cond
@@ -57,6 +44,16 @@
     (php/-> env (setNs ns-name))))
 
 # Checks if the code is Clojure-specific (not Phel)
+# Checks if code is an (in-ns ...) form - Clojure command to switch namespace
+(defn- in-ns-form? [code]
+  (= 1 (php/preg_match "/^\s*\(in-ns\s+'?(\S+)\)\s*$/" code)))
+
+# Extracts the namespace name from (in-ns 'ns-name)
+(defn- extract-in-ns [code]
+  (let [matches (php/array)]
+    (when (= 1 (php/preg_match "/^\s*\(in-ns\s+'?(\S+)\)\s*$/" code matches))
+      (php/aget matches 1))))
+
 (defn- clojure-specific? [code]
   (or (php/str_contains code "clojure.main")
       (php/str_contains code "clojure.core")
@@ -102,16 +99,32 @@
           (println "Registering ns alias:" alias "for" full-ns "in" ns-name)
           (php/:: NreplHelper (registerAlias ns-name alias full-ns)))))))
 
-(defn- evaluate [code ns-name]
+# Helper to send a single Bencode response
+(defn- send-response [connection response]
+  (php/-> connection (write (php/:: Bencode (encode response)))))
+
+(defn- evaluate [code ns-name connection id session]
   (try
     # Empty or nil code
     (if (or (nil? code) (= code ""))
-      (to-php {"value" "nil" "status" ["done"]})
+      (do
+        (send-response connection (phel->php {"id" id "session" session "value" "nil" "ns" ns-name}))
+        (send-response connection (phel->php {"id" id "session" session "status" ["done"]})))
+      # Handle (in-ns 'namespace) - switch namespace
+      (if (in-ns-form? code)
+        (let [new-ns (extract-in-ns code)]
+          (println "Switching namespace to:" new-ns)
+          (when new-ns
+            (php/:: NreplHelper (setEffectiveNs new-ns))
+            (set-current-ns new-ns))
+          (send-response connection (phel->php {"id" id "session" session "value" (str new-ns) "ns" (or new-ns ns-name)}))
+          (send-response connection (phel->php {"id" id "session" session "status" ["done"]})))
       # Ignore Clojure-specific code
       (if (clojure-specific? code)
         (do
           (println "Ignoring Clojure-specific code")
-          (to-php {"value" "nil" "status" ["done"]}))
+          (send-response connection (phel->php {"id" id "session" session "value" "nil" "ns" ns-name}))
+          (send-response connection (phel->php {"id" id "session" session "status" ["done"]})))
         (do
           # Use effective namespace (from previous ns form, or default)
           (let [eff-ns (effective-ns ns-name)]
@@ -132,6 +145,9 @@
                 (handle-ns-form code)
                 # Manually register alias if this was a require
                 (register-require-alias code eff-ns)
+                # Send stdout as separate message (like let-go)
+                (when (and (php/is_string output) (not (= (php/trim output) "")))
+                  (send-response connection (phel->php {"id" id "session" session "out" output})))
                 # If stdout output exists and value is nil: use output as value
                 (let [value-str (result-to-string result)
                       final-value (if (and (= value-str "nil") 
@@ -139,15 +155,18 @@
                                           (not (= (php/trim output) "")))
                                    (php/trim output)
                                    value-str)]
-                  (if (and (php/is_string output) (not (= (php/trim output) "")))
-                    (to-php {"value" final-value "out" output "ns" eff-ns "status" ["done"]})
-                    (to-php {"value" final-value "ns" eff-ns "status" ["done"]})))))))))
+                  # Send value as separate message
+                  (send-response connection (phel->php {"id" id "session" session "value" final-value "ns" eff-ns}))
+                  # Send done as separate message
+                  (send-response connection (phel->php {"id" id "session" session "status" ["done"]}))))))))))
     (catch \Throwable e
       (php/ob_end_clean)
-      (to-php {"ex" (php/-> e (getMessage)) "status" ["done" "eval-error"]}))))
+      # Send error as separate message
+      (send-response connection (phel->php {"id" id "session" session "err" (str (php/-> e (getMessage)) "\n") "ex" "phel.lang.Error" "root-ex" "phel.lang.Error"}))
+      # Send done with eval-error
+      (send-response connection (phel->php {"id" id "session" session "status" ["done" "eval-error"]})))))
 
-(defn- handle-request [data connection]
-  (println "Received data:" data)
+(defn- handle-single-request [data connection]
   (let [msg (php/:: Bencode (decode data))
         op (get msg "op")
         id (get msg "id")
@@ -157,61 +176,56 @@
     (cond
       # nREPL 'clone' - used to start a new session
       (= op "clone")
-      (let [response (to-php {"new-session" session "id" id "status" ["done"]})
+      (let [response (phel->php {"new-session" session "id" id "status" ["done"]})
             encoded (php/:: Bencode (encode response))]
         (println "Sending clone response, encoded:" encoded)
         (php/-> connection (write encoded)))
 
       # describe - server capabilities
       (= op "describe")
-      (let [response (to-php {"id" id 
+      (let [response (phel->php {"id" id 
                               "session" session
-                              "ops" {"clone" {} "describe" {} "eval" {} "close" {} "info" {} "complete" {} "load-file" {}}
-                              "versions" {"phel" {"major" "0" "minor" "10"}}
+                              "ops" {"clone" {} "describe" {} "eval" {} "close" {} "info" {} "complete" {} "load-file" {} "ls-sessions" {}}
+                              "versions" {"phel" {"major" "0" "minor" "31"}}
                               "status" ["done"]})]
         (println "Sending describe response")
-        (php/-> connection (write (php/:: Bencode (encode response)))))
+        (send-response connection response))
 
       # info - symbol info (CIDER)
       (= op "info")
-      (let [response (to-php {"id" id "session" session "status" ["done" "no-info"]})]
-        (println "Info request (not implemented)")
-        (php/-> connection (write (php/:: Bencode (encode response)))))
+      (send-response connection (phel->php {"id" id "session" session "status" ["done" "no-info"]}))
 
       # complete - auto-completion (CIDER)
       (= op "complete")
-      (let [response (to-php {"id" id "session" session "completions" [] "status" ["done"]})]
-        (println "Complete request (not implemented)")
-        (php/-> connection (write (php/:: Bencode (encode response)))))
+      (send-response connection (phel->php {"id" id "session" session "completions" [] "status" ["done"]}))
 
       # load-file - load and evaluate a file
       (= op "load-file")
-      (let [file-content (get msg "file")
-            _ (println "Loading file...")
-            eval-res (evaluate file-content ns-name)
-            response (php/array_merge (to-php {"id" id "session" session}) eval-res)]
-        (php/-> connection (write (php/:: Bencode (encode response)))))
+      (let [file-content (get msg "file")]
+        (println "Loading file...")
+        (evaluate file-content ns-name connection id session))
 
       # eval - evaluate code
       (= op "eval")
-      (let [code (get msg "code")
-            _ (println "Evaluating:" code)
-            eval-res (evaluate code ns-name)
-            response (php/array_merge (to-php {"id" id "session" session}) eval-res)]
-        (println "Sending eval response:" response)
-        (php/-> connection (write (php/:: Bencode (encode response)))))
+      (let [code (get msg "code")]
+        (println "Evaluating:" code)
+        (evaluate code ns-name connection id session))
+
+      # ls-sessions
+      (= op "ls-sessions")
+      (send-response connection (phel->php {"id" id "session" session "sessions" [session] "status" ["done"]}))
 
       # close - close session
       (= op "close")
-      (let [response (to-php {"id" id "session" session "status" ["done"]})]
+      (do
         (println "Closing session")
-        (php/-> connection (write (php/:: Bencode (encode response)))))
+        (send-response connection (phel->php {"id" id "session" session "status" ["done" "session-closed"]})))
       
       # Fallback for unknown ops
       :else
-      (let [response (to-php {"id" id "session" session "status" ["done" "unknown-op"]})]
+      (do
         (println "Unknown op:" op)
-        (php/-> connection (write (php/:: Bencode (encode response))))))))
+        (send-response connection (phel->php {"id" id "session" session "status" ["done" "error" "unknown-op"]}))))))
 
 (defn start-server [host port]
   (init-repl-helpers)  # Initialize REPL helpers for the user namespace
@@ -221,9 +235,23 @@
         (fn [connection]
           (println "Client connected!")
           (php/-> connection (on "data" 
-            (fn [data] (handle-request data connection)))))))
+            (fn [data]
+              (println "Received data:" data)
+              # Split concatenated bencode messages from single TCP packet
+              (let [messages (php/:: NreplHelper (splitBencodeMessages data))]
+                (foreach [msg messages]
+                  (try
+                    (handle-single-request msg connection)
+                    (catch \Throwable e
+                      (println "Error handling request:" (php/-> e (getMessage)))))))))))))
       
-      (println (str "Phel nREPL server listening on " host ":" port))
+      # Write port file AFTER TcpServer is created (already listening)
+      # This ensures Calva only connects when the server is ready
+      (let [port-file (str (php/getcwd) "/.nrepl-port")]
+        (php/file_put_contents port-file (str port))
+        (println (str "Wrote " port-file)))
+      # Standard nREPL banner - Calva Jack-in scans stdout for this exact format
+      (println (str "nREPL server started on port " port " on host " host " - nrepl://" host ":" port))
       (php/-> loop (run)))))
 
 # Start the server

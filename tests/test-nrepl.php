@@ -39,12 +39,67 @@ class NreplTestClient
         $encoded = Bencode::encode($message);
         fwrite($this->socket, $encoded);
         
-        $response = fread($this->socket, 65536);
-        if ($response === false || $response === '') {
-            throw new RuntimeException("No response from server");
+        // Debug: show what we sent
+        $debug = getenv('NREPL_DEBUG') !== false;
+        if ($debug) fwrite(STDERR, "SEND op=" . $message['op'] . " len=" . strlen($encoded) . "\n");
+        
+        // Read all response messages until we get one with "status" containing "done"
+        // Server sends separate messages for out, value, and done
+        $merged = [];
+        $buffer = '';
+        $maxReads = 10;
+        while ($maxReads-- > 0) {
+            // After first read, use shorter timeout for subsequent chunks
+            if (!empty($merged)) {
+                stream_set_timeout($this->socket, 0, 500000); // 500ms
+            }
+            $chunk = fread($this->socket, 65536);
+            $info = stream_get_meta_data($this->socket);
+            if ($debug) fwrite(STDERR, "  READ chunk=" . strlen($chunk ?: '') . " timed_out=" . ($info['timed_out'] ? 'Y' : 'N') . " eof=" . ($info['eof'] ? 'Y' : 'N') . "\n");
+            if ($chunk === false || $chunk === '') {
+                if ($info['timed_out'] && !empty($merged)) break;
+                if ($chunk === false) break;
+                continue;
+            }
+            $buffer .= $chunk;
+            
+            // Parse all complete bencode messages from buffer
+            $pos = 0;
+            while ($pos < strlen($buffer)) {
+                $startPos = $pos;
+                try {
+                    // Use a non-zero offset wrapper to avoid "Could not fully decode" error
+                    // when multiple bencode messages are concatenated
+                    $tempBuf = ' ' . substr($buffer, $pos);
+                    $tempPos = 1;
+                    $part = Bencode::decode($tempBuf, $tempPos);
+                    $pos += ($tempPos - 1);
+                    if (is_array($part)) {
+                        foreach ($part as $k => $v) {
+                            $merged[$k] = $v;
+                        }
+                        if (isset($part['status']) && is_array($part['status']) && in_array('done', $part['status'])) {
+                            // Restore default timeout
+                            stream_set_timeout($this->socket, 5);
+                            return $merged;
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    // Incomplete message, need more data
+                    $pos = $startPos;
+                    break;
+                }
+            }
+            // Keep unparsed remainder in buffer
+            $buffer = substr($buffer, $pos);
         }
         
-        return Bencode::decode($response);
+        if (empty($merged)) {
+            throw new RuntimeException("No response from server");
+        }
+        // Restore default timeout
+        stream_set_timeout($this->socket, 5);
+        return $merged;
     }
 
     public function clone(): array

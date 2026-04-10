@@ -30,6 +30,18 @@ require $autoloader;
 // Determine the project root (where composer.json lives)
 $projectRoot = dirname($autoloader, 2);
 
+// Port file is now written by the Phel code AFTER TcpServer starts listening
+// This ensures Calva only connects when the server is ready
+$port = 7888;
+$portFile = $projectRoot . '/.nrepl-port';
+
+// Clean up .nrepl-port on shutdown
+register_shutdown_function(function () use ($portFile) {
+    if (file_exists($portFile)) {
+        unlink($portFile);
+    }
+});
+
 use Gacela\Framework\Gacela;
 use Phel\Phel;
 

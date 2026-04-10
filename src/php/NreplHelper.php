@@ -108,4 +108,52 @@ class NreplHelper
         $fullSymbol = \Phel\Lang\Symbol::create($fullNamespace);
         $env->addRequireAlias($namespace, $aliasSymbol, $fullSymbol);
     }
+
+    /**
+     * Split concatenated bencode messages from a single TCP data event.
+     * Returns an array of individual bencode message strings.
+     */
+    public static function splitBencodeMessages(string $data): array
+    {
+        $messages = [];
+        $pos = 0;
+        $len = strlen($data);
+
+        while ($pos < $len) {
+            $start = $pos;
+            $depth = 0;
+
+            do {
+                if ($pos >= $len) break;
+                $ch = $data[$pos];
+
+                if ($ch === 'd' || $ch === 'l') {
+                    $depth++;
+                    $pos++;
+                } elseif ($ch === 'e') {
+                    $depth--;
+                    $pos++;
+                } elseif ($ch === 'i') {
+                    // integer: i<number>e
+                    $pos++;
+                    while ($pos < $len && $data[$pos] !== 'e') $pos++;
+                    $pos++; // skip 'e'
+                } elseif (ctype_digit($ch)) {
+                    // string: N:...
+                    $colonPos = strpos($data, ':', $pos);
+                    if ($colonPos === false) { $pos++; continue; }
+                    $strLen = (int)substr($data, $pos, $colonPos - $pos);
+                    $pos = $colonPos + 1 + $strLen;
+                } else {
+                    $pos++;
+                }
+            } while ($depth > 0 && $pos < $len);
+
+            if ($pos > $start) {
+                $messages[] = substr($data, $start, $pos - $start);
+            }
+        }
+
+        return $messages;
+    }
 }
