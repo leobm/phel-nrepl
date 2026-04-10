@@ -438,18 +438,38 @@ class NreplTests
             $this->assertContains('done', $response['status']);
         });
 
-        // info op (stub - returns no-info)
-        $this->test('info operation (stub)', function () {
+        // info op - returns symbol info from phel\core
+        $this->test('info for known symbol', function () {
             $response = $this->client->info('map');
             $this->assertContains('done', $response['status']);
+            $this->assertEquals('map', $response['name']);
+            $this->assertEquals('phel\\core', $response['ns']);
+            $this->assertArrayHasKey('doc', $response);
+        });
+
+        // info for unknown symbol
+        $this->test('info for unknown symbol', function () {
+            $response = $this->client->info('nonexistent-xyz-123');
             $this->assertContains('no-info', $response['status']);
         });
 
-        // completions op (stub - returns empty)
-        $this->test('completions operation (stub)', function () {
-            $response = $this->client->complete('map');
+        // completions op - returns matching candidates
+        $this->test('completions with prefix', function () {
+            $response = $this->client->complete('ma');
             $this->assertArrayHasKey('completions', $response);
             $this->assertContains('done', $response['status']);
+            $comps = $response['completions'];
+            // Should find map, mapcat, etc.
+            $candidates = array_column($comps, 'candidate');
+            $this->assertContains('map', $candidates);
+        });
+
+        // completions for unknown prefix
+        $this->test('completions empty result', function () {
+            $response = $this->client->complete('zzzznonexistent');
+            $this->assertArrayHasKey('completions', $response);
+            $comps = $response['completions'];
+            $this->assertEquals(0, count($comps));
         });
 
         // interrupt op

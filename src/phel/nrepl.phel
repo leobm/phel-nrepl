@@ -3,6 +3,7 @@
   (:use Phel\Compiler\CompilerFacade)
   (:use Phel\Compiler\Infrastructure\CompileOptions)
   (:use Phel\Compiler\Infrastructure\GlobalEnvironmentSingleton)
+  (:use Phel\Compiler\Application\Munge)
   (:use Phel\Lang\Symbol)
   (:use Phel\Lang\Registry)
   (:use PhelNrepl\NreplHelper)
@@ -61,7 +62,7 @@
       (php/str_contains code "nrepl.")
       (php/str_contains code "cider.")))
 
-# Transforms REPL calls - replaces (require ... with (phel\repl/require ...
+# Transforms REPL calls - replaces require/use/doc with phel\repl/ prefixed versions
 # Uses PHP helper to avoid backslash escape issues
 (defn- transform-repl-code [code]
   (php/:: NreplHelper (transformReplCode code)))
@@ -190,19 +191,188 @@
   (println "Sending describe response")
   (reply-with-done connection id session
     {"ops" {"clone" {} "describe" {} "eval" {} "close" {} "info" {} "lookup" {} "complete" {} "completions" {} "load-file" {} "ls-sessions" {} "interrupt" {}}
-     "versions" {"phel" {"major" "0" "minor" "31"}}}))
+     "versions" {"phel" {"major" "0" "minor" "31"} "phel-nrepl" {"major" "0" "minor" "2" "incremental" "0"}}}))
+
+# --- Completion helpers ---
+
+(defn- munge-ns [ns-str]
+  (let [munge (php/new Munge)]
+    (php/-> munge (encodeNs ns-str))))
+
+(defn- get-completions [prefix ns-name]
+  (let [registry (php/:: Registry (getInstance))
+        env (php/:: GlobalEnvironmentSingleton (getInstance))
+        munge (php/new Munge)
+        eff-ns (effective-ns ns-name)
+        encoded-ns (munge-ns eff-ns)
+        results (php/array)
+        # Check if prefix has alias/ form (e.g. "json/de")
+        has-slash (php/str_contains prefix "/")
+        alias-part (when has-slash (php/strstr prefix "/" true))
+        name-part (when has-slash (php/substr prefix (php/+ 1 (php/strlen alias-part))))]
+    # [1] If prefix is alias/name, complete from aliased namespace
+    (when (and has-slash (not (= alias-part "php")))
+      # First try alias resolution
+      (let [aliases (php/-> env (getRequireAliases eff-ns))
+            found-alias false]
+        (foreach [a target-sym aliases]
+          (when (= a alias-part)
+            (let [target-ns (php/-> target-sym (getName))
+                  defs (php/-> registry (getDefinitionInNamespace target-ns))]
+              (foreach [fn-name _val defs]
+                (let [decoded (php/-> munge (decodeNs fn-name))
+                      meta (php/-> registry (getDefinitionMetaData target-ns fn-name))]
+                  (when (and (not (get meta :private))
+                             (or (= name-part "") (= 0 (php/strpos decoded name-part))))
+                    (php/aset results (php/count results)
+                      (phel->php {"candidate" (str alias-part "/" decoded)
+                                  "ns" (php/-> munge (decodeNs target-ns))
+                                  "type" "function"}))))))))
+      # Also try fully-qualified namespace (e.g. phel\json/decode)
+      (let [all-ns (php/-> registry (getNamespaces))
+            decoded-alias (php/-> munge (decodeNs alias-part))
+            encoded-alias (munge-ns alias-part)]
+        (foreach [ns-name all-ns]
+          (let [decoded-ns (php/-> munge (decodeNs ns-name))]
+            (when (or (= decoded-ns alias-part) (= ns-name encoded-alias))
+              (let [defs (php/-> registry (getDefinitionInNamespace ns-name))]
+                (foreach [fn-name _val defs]
+                  (let [decoded (php/-> munge (decodeNs fn-name))
+                        meta (php/-> registry (getDefinitionMetaData ns-name fn-name))]
+                    (when (and (not (get meta :private))
+                               (or (= name-part "") (= 0 (php/strpos decoded name-part))))
+                      (php/aset results (php/count results)
+                        (phel->php {"candidate" (str decoded-ns "/" decoded)
+                                    "ns" decoded-ns
+                                    "type" "function"}))))))))))))
+    # [1b] php/ prefix: complete PHP built-in functions and classes
+    (when (and has-slash (= alias-part "php"))
+      (let [all-fns (php/aget (php/get_defined_functions) "internal")]
+        (foreach [fn-name all-fns]
+          (when (or (= name-part "") (= 0 (php/strpos fn-name name-part)))
+            (php/aset results (php/count results)
+              (phel->php {"candidate" (str "php/" fn-name)
+                          "ns" "php"
+                          "type" "function"})))))
+      # Also complete PHP classes
+      (let [classes (php/get_declared_classes)]
+        (foreach [cls classes]
+          (let [short-name (php/ltrim cls "\\")]
+            (when (or (= name-part "") (= 0 (php/strpos short-name name-part)))
+              (php/aset results (php/count results)
+                (phel->php {"candidate" (str "php/" short-name)
+                            "ns" "php"
+                            "type" "class"})))))))
+    (when (not has-slash)
+      (let [defs (php/-> registry (getDefinitionInNamespace encoded-ns))]
+        (foreach [fn-name _val defs]
+          (let [decoded (php/-> munge (decodeNs fn-name))
+                meta (php/-> registry (getDefinitionMetaData encoded-ns fn-name))]
+            (when (and (not (get meta :private))
+                       (or (= prefix "") (= 0 (php/strpos decoded prefix))))
+              (php/aset results (php/count results)
+                (phel->php {"candidate" decoded
+                            "ns" (php/-> munge (decodeNs encoded-ns))
+                            "type" "function"})))))))
+    # [3] Complete from phel\core
+    (when (not has-slash)
+      (let [core-defs (php/-> registry (getDefinitionInNamespace "phel\\core"))]
+        (foreach [fn-name _val core-defs]
+          (let [decoded (php/-> munge (decodeNs fn-name))
+                meta (php/-> registry (getDefinitionMetaData "phel\\core" fn-name))]
+            (when (and (not (get meta :private))
+                       (or (= prefix "") (= 0 (php/strpos decoded prefix))))
+              (php/aset results (php/count results)
+                (phel->php {"candidate" decoded
+                            "ns" "phel\\core"
+                            "type" "function"})))))))
+    # [4] Complete namespace aliases as candidates, including php/
+    (when (not has-slash)
+      (let [aliases (php/-> env (getRequireAliases eff-ns))]
+        (foreach [a _target aliases]
+          (when (or (= prefix "") (= 0 (php/strpos a prefix)))
+            (php/aset results (php/count results)
+              (phel->php {"candidate" a
+                          "type" "namespace"})))))
+      # Also suggest "php" as a namespace-like prefix
+      (when (or (= prefix "") (= 0 (php/strpos "php" prefix)))
+        (php/aset results (php/count results)
+          (phel->php {"candidate" "php"
+                      "type" "namespace"})))
+      # Suggest fully-qualified namespace names (e.g. phel\ -> phel\json, phel\str, ...)
+      (let [all-ns (php/-> registry (getNamespaces))]
+        (foreach [ns-name all-ns]
+          (let [decoded-ns (php/-> munge (decodeNs ns-name))]
+            (when (and (not (= decoded-ns prefix))
+                       (or (= prefix "") (= 0 (php/strpos decoded-ns prefix))))
+              (php/aset results (php/count results)
+                (phel->php {"candidate" decoded-ns
+                            "type" "namespace"})))))))
+    results))
+
+# --- Symbol info helper ---
+
+(defn- build-info-map [sym-name target-ns encoded-name registry munge]
+  (let [meta (php/-> registry (getDefinitionMetaData target-ns encoded-name))]
+    (when meta
+      (let [start-loc (get meta :start-location)
+            end-loc (get meta :end-location)]
+        {"name" sym-name
+         "ns" (php/-> munge (decodeNs target-ns))
+         "doc" (or (get meta :doc) "")
+         "file" (when start-loc (get start-loc :file))
+         "line" (when start-loc (get start-loc :line))
+         "column" (when start-loc (get start-loc :column))
+         "end-line" (when end-loc (get end-loc :line))
+         "end-column" (when end-loc (get end-loc :column))
+         "arglists" ""
+         "status" ["done"]}))))
+
+(defn- get-symbol-info [sym-name ns-name]
+  (let [registry (php/:: Registry (getInstance))
+        munge (php/new Munge)
+        eff-ns (effective-ns ns-name)
+        env (php/:: GlobalEnvironmentSingleton (getInstance))
+        # Check if sym has alias/ form
+        has-slash (php/str_contains sym-name "/")
+        parts (when has-slash (php/explode "/" sym-name 2))
+        alias-part (when has-slash (php/aget parts 0))
+        name-part (when has-slash (php/aget parts 1))
+        # Resolve the target namespace
+        target-ns (if has-slash
+                    (let [aliases (php/-> env (getRequireAliases eff-ns))
+                          found (php/aget aliases alias-part)]
+                      (when found (php/-> found (getName))))
+                    (munge-ns eff-ns))
+        lookup-name (if has-slash name-part sym-name)
+        encoded-name (php/-> munge (encode lookup-name))]
+    (when target-ns
+      # Try target namespace first, then fall back to phel\core
+      (or (build-info-map lookup-name target-ns encoded-name registry munge)
+          (when (not has-slash)
+            (build-info-map lookup-name "phel\\core" encoded-name registry munge))))))
 
 (defmethod handle-op "info" [op connection id session ns-name msg]
-  (reply connection id session {"status" ["done" "no-info"]}))
+  (let [sym (or (get msg "sym") (get msg "symbol") "")
+        info (when (not (= sym "")) (get-symbol-info sym ns-name))]
+    (if info
+      (reply-with-done connection id session info)
+      (reply connection id session {"status" ["done" "no-info"]}))))
 
 (defmethod handle-op "complete" [op connection id session ns-name msg]
-  (reply-with-done connection id session {"completions" []}))
+  (let [prefix (or (get msg "prefix") (get msg "symbol") "")]
+    (reply-with-done connection id session {"completions" (get-completions prefix ns-name)})))
 
 (defmethod handle-op "completions" [op connection id session ns-name msg]
-  (reply-with-done connection id session {"completions" []}))
+  (let [prefix (or (get msg "prefix") (get msg "symbol") "")]
+    (reply-with-done connection id session {"completions" (get-completions prefix ns-name)})))
 
 (defmethod handle-op "lookup" [op connection id session ns-name msg]
-  (reply connection id session {"status" ["done" "no-info"]}))
+  (let [sym (or (get msg "sym") (get msg "symbol") "")
+        info (when (not (= sym "")) (get-symbol-info sym ns-name))]
+    (if info
+      (reply-with-done connection id session {"info" (phel->php info)})
+      (reply connection id session {"status" ["done" "no-info"]}))))
 
 (defmethod handle-op "interrupt" [op connection id session ns-name msg]
   (reply connection id session {"status" ["done" "session-idle"]}))
