@@ -1,6 +1,7 @@
 {
     "name": "phel-lang/phel-nrepl",
     "description": "nREPL server for Phel, enabling interactive development with Calva and other nREPL clients",
+    "version": "0.1.0",
     "type": "library",
     "license": "MIT",
     "keywords": ["phel", "nrepl", "repl", "calva"],
