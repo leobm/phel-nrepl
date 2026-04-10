@@ -125,6 +125,36 @@ class NreplTestClient
     {
         return $this->send(['op' => 'close']);
     }
+
+    public function lsSessions(): array
+    {
+        return $this->send(['op' => 'ls-sessions']);
+    }
+
+    public function info(string $symbol, string $ns = 'user'): array
+    {
+        return $this->send(['op' => 'info', 'symbol' => $symbol, 'ns' => $ns]);
+    }
+
+    public function complete(string $prefix, string $ns = 'user'): array
+    {
+        return $this->send(['op' => 'completions', 'prefix' => $prefix, 'ns' => $ns]);
+    }
+
+    public function interrupt(): array
+    {
+        return $this->send(['op' => 'interrupt']);
+    }
+
+    public function loadFile(string $file, string $ns = 'user'): array
+    {
+        return $this->send(['op' => 'load-file', 'file' => $file, 'ns' => $ns]);
+    }
+
+    public function sendRaw(array $message): array
+    {
+        return $this->send($message);
+    }
 }
 
 /**
@@ -179,6 +209,24 @@ class NreplTests
         if (!array_key_exists($key, $array)) {
             throw new RuntimeException(
                 $message ?: "Expected array to have key '$key'"
+            );
+        }
+    }
+
+    private function assertStringContains(string $needle, string $haystack, string $message = ''): void
+    {
+        if (strpos($haystack, $needle) === false) {
+            throw new RuntimeException(
+                $message ?: "Expected string to contain '$needle', got: '$haystack'"
+            );
+        }
+    }
+
+    private function assertNotEquals($expected, $actual, string $message = ''): void
+    {
+        if ($expected === $actual) {
+            throw new RuntimeException(
+                $message ?: "Expected value to differ from " . json_encode($expected)
             );
         }
     }
@@ -297,6 +345,131 @@ class NreplTests
             }
             $this->assertArrayHasKey('value', $response);
             $this->assertContains('done', $response['status']);
+        });
+
+        // === New tests ===
+
+        // Empty code returns nil
+        $this->test('eval empty string', function () {
+            $response = $this->client->eval('');
+            $this->assertEquals('nil', $response['value']);
+            $this->assertContains('done', $response['status']);
+        });
+
+        // Error handling - syntax error
+        $this->test('eval syntax error', function () {
+            $response = $this->client->eval('(+ 1');
+            $this->assertArrayHasKey('err', $response);
+            $this->assertContains('eval-error', $response['status']);
+            $this->assertContains('done', $response['status']);
+        });
+
+        // Error handling - undefined symbol
+        $this->test('eval undefined symbol', function () {
+            $response = $this->client->eval('(nonexistent-function 1 2 3)');
+            $this->assertArrayHasKey('err', $response);
+            $this->assertContains('eval-error', $response['status']);
+        });
+
+        // in-ns form
+        $this->test('eval (in-ns \'my-test-ns)', function () {
+            $response = $this->client->eval("(in-ns 'my-test-ns)");
+            $this->assertArrayHasKey('value', $response);
+            $this->assertContains('done', $response['status']);
+        });
+
+        // Data structures - vector
+        $this->test('eval vector [1 2 3]', function () {
+            $response = $this->client->eval('[1 2 3]');
+            $this->assertEquals('[1 2 3]', $response['value']);
+        });
+
+        // Data structures - hash map
+        $this->test('eval hash map {:a 1}', function () {
+            $response = $this->client->eval('{:a 1 :b 2}');
+            $this->assertArrayHasKey('value', $response);
+            $this->assertContains('done', $response['status']);
+        });
+
+        // def + use across evals
+        $this->test('eval def + use', function () {
+            $this->client->eval('(def my-test-val 42)');
+            $response = $this->client->eval('my-test-val');
+            $this->assertEquals('42', $response['value']);
+        });
+
+        // Stdout capture (println inside eval)
+        $this->test('eval println captures stdout', function () {
+            $response = $this->client->eval('(println "hello-from-test")');
+            // stdout should appear as 'out' key
+            if (isset($response['out'])) {
+                $this->assertStringContains('hello-from-test', $response['out']);
+            }
+            $this->assertContains('done', $response['status']);
+        });
+
+        // Boolean values
+        $this->test('eval boolean true', function () {
+            $response = $this->client->eval('(= 1 1)');
+            $this->assertEquals('true', $response['value']);
+        });
+
+        $this->test('eval boolean false', function () {
+            $response = $this->client->eval('(= 1 2)');
+            $this->assertEquals('false', $response['value']);
+        });
+
+        // nil value
+        $this->test('eval nil', function () {
+            $response = $this->client->eval('nil');
+            $this->assertEquals('nil', $response['value']);
+        });
+
+        // String eval
+        $this->test('eval string literal', function () {
+            $response = $this->client->eval('"hello world"');
+            $this->assertEquals('hello world', $response['value']);
+        });
+
+        // ls-sessions op
+        $this->test('ls-sessions operation', function () {
+            $response = $this->client->lsSessions();
+            $this->assertArrayHasKey('sessions', $response);
+            $this->assertContains('done', $response['status']);
+        });
+
+        // info op (stub - returns no-info)
+        $this->test('info operation (stub)', function () {
+            $response = $this->client->info('map');
+            $this->assertContains('done', $response['status']);
+            $this->assertContains('no-info', $response['status']);
+        });
+
+        // completions op (stub - returns empty)
+        $this->test('completions operation (stub)', function () {
+            $response = $this->client->complete('map');
+            $this->assertArrayHasKey('completions', $response);
+            $this->assertContains('done', $response['status']);
+        });
+
+        // interrupt op
+        $this->test('interrupt operation', function () {
+            $response = $this->client->interrupt();
+            $this->assertContains('done', $response['status']);
+        });
+
+        // load-file op
+        $this->test('load-file operation', function () {
+            $response = $this->client->loadFile('(+ 10 20)');
+            $this->assertEquals('30', $response['value']);
+            $this->assertContains('done', $response['status']);
+        });
+
+        // Unknown op
+        $this->test('unknown op', function () {
+            $response = $this->client->sendRaw(['op' => 'nonexistent-op']);
+            $this->assertContains('done', $response['status']);
+            $this->assertContains('unknown-op', $response['status']);
         });
 
         // Close operation

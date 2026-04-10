@@ -12,6 +12,26 @@ An nREPL server for [Phel](https://phel-lang.org/), written in Phel itself. Allo
 
 ### As a dependency in your Phel project
 
+This package is not yet on Packagist. Add the GitHub repository to your `composer.json`:
+
+```json
+{
+    "require": {
+        "phel-lang/phel-nrepl": "dev-main"
+    },
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/leobm/phel-nrepl.git"
+        }
+    ],
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}
+```
+
+Then run:
+
 ```bash
 composer update
 ```
@@ -44,14 +64,44 @@ bin/phel-nrepl
 
 The server listens on `127.0.0.1:7888` by default.
 
-### Connecting with Calva (VS Code)
+### VS Code / Calva Setup
 
-1. Start the nREPL server with `vendor/bin/phel-nrepl`
-2. In VS Code, open the command palette and run **Calva: Connect to a Running REPL Server...**
-3. Select **Generic** as the project type
-4. Enter `localhost:7888` as the host and port
+Add the following to your project's `.vscode/settings.json`:
 
-You can now evaluate Phel code from your editor.
+```json
+{
+  "calva.replConnectSequences": [
+    {
+      "name": "phel",
+      "projectType": "custom",
+      "customJackInCommandLine": "lsof -ti:7888 | xargs kill -9 2>/dev/null; ./vendor/bin/phel-nrepl",
+      "nReplPortFile": [".nrepl-port"],
+      "cljsType": "none"
+    }
+  ],
+  "files.associations": {
+    "*.phel": "clojure"
+  }
+}
+```
+
+This enables:
+- **Jack-in**: Run **Calva: Start a Project REPL and Connect (aka Jack-In)** from the command palette — starts the nREPL server and connects automatically
+- **Connect**: Run **Calva: Connect to a Running REPL Server** from the command palette — connects to an already running server (select "Generic", enter `localhost:7888`)
+- Syntax highlighting for `.phel` files via Clojure grammar
+
+### clj-kondo Configuration
+
+Calva uses [clj-kondo](https://github.com/clj-kondo/clj-kondo) for linting. Since Phel syntax differs from Clojure (e.g. `php/::`, `defn-`, `#` comments), kondo will report false errors. To suppress them, create `.clj-kondo/config.edn` in your project root:
+
+```edn
+{:output {:exclude-files [".*\\.phel$"]}
+ :config-in-glob {"*.phel" {:linters {:all {:level :off}}}}}
+```
+
+This disables all linters for `.phel` files and excludes them from kondo's output.
+
+> **Note:** clj-kondo only reads `.clj-kondo/config.edn` — this cannot be configured via VS Code settings.
 
 ### Supported REPL Functions
 
@@ -88,15 +138,19 @@ The server supports common Phel REPL operations:
 
 ### Supported nREPL Operations
 
-| Operation   | Status      |
-|-------------|-------------|
-| `clone`     | supported   |
-| `describe`  | supported   |
-| `eval`      | supported   |
-| `load-file` | supported   |
-| `close`     | supported   |
-| `info`      | stub        |
-| `complete`  | stub        |
+| Operation     | Status      |
+|---------------|-------------|
+| `clone`       | supported   |
+| `describe`    | supported   |
+| `eval`        | supported   |
+| `load-file`   | supported   |
+| `close`       | supported   |
+| `ls-sessions` | supported   |
+| `info`        | stub        |
+| `lookup`      | stub        |
+| `complete`    | stub        |
+| `completions` | stub        |
+| `interrupt`   | stub        |
 
 ## Architecture
 

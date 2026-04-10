@@ -103,68 +103,130 @@
 (defn- send-response [connection response]
   (php/-> connection (write (php/:: Bencode (encode response)))))
 
+# Build a response map with common fields, merged with extra fields
+(defn- make-response [id session extra]
+  (merge {"id" id "session" session} extra))
+
+# Send a response with common fields + extra fields map
+(defn- reply [connection id session extra]
+  (send-response connection (phel->php (make-response id session extra))))
+
+# Send a "done" status response
+(defn- reply-done [connection id session]
+  (reply connection id session {"status" ["done"]}))
+
+# Send a response with extra fields + automatic "done" status
+(defn- reply-with-done [connection id session extra]
+  (reply connection id session (merge {"status" ["done"]} extra)))
+
+# Send value + ns, then done
+(defn- reply-value-done [connection id session value ns-name]
+  (reply connection id session {"value" value "ns" ns-name})
+  (reply-done connection id session))
+
+# Send error + done with eval-error
+(defn- reply-error [connection id session error-msg]
+  (reply connection id session {"err" (str error-msg "\n") "ex" "phel.lang.Error" "root-ex" "phel.lang.Error"})
+  (reply connection id session {"status" ["done" "eval-error"]}))
+
 (defn- evaluate [code ns-name connection id session]
   (try
-    # Empty or nil code
-    (if (or (nil? code) (= code ""))
-      (do
-        (send-response connection (phel->php {"id" id "session" session "value" "nil" "ns" ns-name}))
-        (send-response connection (phel->php {"id" id "session" session "status" ["done"]})))
+    (cond
+      # Empty or nil code
+      (or (nil? code) (= code ""))
+      (reply-value-done connection id session "nil" ns-name)
+
       # Handle (in-ns 'namespace) - switch namespace
-      (if (in-ns-form? code)
-        (let [new-ns (extract-in-ns code)]
-          (println "Switching namespace to:" new-ns)
-          (when new-ns
-            (php/:: NreplHelper (setEffectiveNs new-ns))
-            (set-current-ns new-ns))
-          (send-response connection (phel->php {"id" id "session" session "value" (str new-ns) "ns" (or new-ns ns-name)}))
-          (send-response connection (phel->php {"id" id "session" session "status" ["done"]})))
+      (in-ns-form? code)
+      (let [new-ns (extract-in-ns code)]
+        (println "Switching namespace to:" new-ns)
+        (when new-ns
+          (php/:: NreplHelper (setEffectiveNs new-ns))
+          (set-current-ns new-ns))
+        (reply-value-done connection id session (str new-ns) (or new-ns ns-name)))
+
       # Ignore Clojure-specific code
-      (if (clojure-specific? code)
-        (do
-          (println "Ignoring Clojure-specific code")
-          (send-response connection (phel->php {"id" id "session" session "value" "nil" "ns" ns-name}))
-          (send-response connection (phel->php {"id" id "session" session "status" ["done"]})))
-        (do
-          # Use effective namespace (from previous ns form, or default)
-          (let [eff-ns (effective-ns ns-name)]
-            (when eff-ns 
-              (set-current-ns eff-ns)
-              # Set phel\core/*ns* for require aliases (used by set-var)
-              (php/-> (php/:: Registry (getInstance))
-                      (addDefinition "phel\\core" "*ns*" eff-ns)))
-            # Transform code (require -> phel\repl/require etc.)
-            (let [transformed (transform-repl-code code)]
-              (println "Original:" code)
-              (println "Transformed:" transformed)
-              # Capture stdout (for doc, source etc.)
-              (php/ob_start)
-              (let [result (php/-> compiler-facade (eval transformed))
-                    output (php/ob_get_clean)]
-                # Detect (ns ...) forms and track namespace + aliases
-                (handle-ns-form code)
-                # Manually register alias if this was a require
-                (register-require-alias code eff-ns)
-                # Send stdout as separate message (like let-go)
-                (when (and (php/is_string output) (not (= (php/trim output) "")))
-                  (send-response connection (phel->php {"id" id "session" session "out" output})))
-                # If stdout output exists and value is nil: use output as value
-                (let [value-str (result-to-string result)
-                      final-value (if (and (= value-str "nil") 
-                                          (php/is_string output) 
-                                          (not (= (php/trim output) "")))
-                                   (php/trim output)
-                                   value-str)]
-                  # Send value as separate message
-                  (send-response connection (phel->php {"id" id "session" session "value" final-value "ns" eff-ns}))
-                  # Send done as separate message
-                  (send-response connection (phel->php {"id" id "session" session "status" ["done"]}))))))))))
+      (clojure-specific? code)
+      (do
+        (println "Ignoring Clojure-specific code")
+        (reply-value-done connection id session "nil" ns-name))
+
+      # Normal eval
+      :else
+      (let [eff-ns (effective-ns ns-name)]
+        (when eff-ns 
+          (set-current-ns eff-ns)
+          (php/-> (php/:: Registry (getInstance))
+                  (addDefinition "phel\\core" "*ns*" eff-ns)))
+        (let [transformed (transform-repl-code code)]
+          (println "Original:" code)
+          (println "Transformed:" transformed)
+          (php/ob_start)
+          (let [result (php/-> compiler-facade (eval transformed))
+                output (php/ob_get_clean)]
+            (handle-ns-form code)
+            (register-require-alias code eff-ns)
+            (when (and (php/is_string output) (not (= (php/trim output) "")))
+              (reply connection id session {"out" output}))
+            (let [value-str (result-to-string result)
+                  final-value (if (and (= value-str "nil") 
+                                      (php/is_string output) 
+                                      (not (= (php/trim output) "")))
+                               (php/trim output)
+                               value-str)]
+              (reply-value-done connection id session final-value eff-ns))))))
     (catch \Throwable e
       (php/ob_end_clean)
-      # Send error as separate message
-      (send-response connection (phel->php {"id" id "session" session "err" (str (php/-> e (getMessage)) "\n") "ex" "phel.lang.Error" "root-ex" "phel.lang.Error"}))
-      # Send done with eval-error
-      (send-response connection (phel->php {"id" id "session" session "status" ["done" "eval-error"]})))))
+      (reply-error connection id session (php/-> e (getMessage))))))
+
+# Multimethod dispatching on the "op" string
+(defmulti handle-op (fn [op connection id session ns-name msg] op))
+
+(defmethod handle-op "clone" [op connection id session ns-name msg]
+  (println "Sending clone response")
+  (reply-with-done connection id session {"new-session" session}))
+
+(defmethod handle-op "describe" [op connection id session ns-name msg]
+  (println "Sending describe response")
+  (reply-with-done connection id session
+    {"ops" {"clone" {} "describe" {} "eval" {} "close" {} "info" {} "lookup" {} "complete" {} "completions" {} "load-file" {} "ls-sessions" {} "interrupt" {}}
+     "versions" {"phel" {"major" "0" "minor" "31"}}}))
+
+(defmethod handle-op "info" [op connection id session ns-name msg]
+  (reply connection id session {"status" ["done" "no-info"]}))
+
+(defmethod handle-op "complete" [op connection id session ns-name msg]
+  (reply-with-done connection id session {"completions" []}))
+
+(defmethod handle-op "completions" [op connection id session ns-name msg]
+  (reply-with-done connection id session {"completions" []}))
+
+(defmethod handle-op "lookup" [op connection id session ns-name msg]
+  (reply connection id session {"status" ["done" "no-info"]}))
+
+(defmethod handle-op "interrupt" [op connection id session ns-name msg]
+  (reply connection id session {"status" ["done" "session-idle"]}))
+
+(defmethod handle-op "load-file" [op connection id session ns-name msg]
+  (let [file-content (get msg "file")]
+    (println "Loading file...")
+    (evaluate file-content ns-name connection id session)))
+
+(defmethod handle-op "eval" [op connection id session ns-name msg]
+  (let [code (get msg "code")]
+    (println "Evaluating:" code)
+    (evaluate code ns-name connection id session)))
+
+(defmethod handle-op "ls-sessions" [op connection id session ns-name msg]
+  (reply-with-done connection id session {"sessions" [session]}))
+
+(defmethod handle-op "close" [op connection id session ns-name msg]
+  (println "Closing session")
+  (reply connection id session {"status" ["done" "session-closed"]}))
+
+(defmethod handle-op :default [op connection id session ns-name msg]
+  (println "Unknown op:" op)
+  (reply connection id session {"status" ["done" "error" "unknown-op"]}))
 
 (defn- handle-single-request [data connection]
   (let [msg (php/:: Bencode (decode data))
@@ -173,59 +235,7 @@
         session (get msg "session" "default-session")
         ns-name (get msg "ns" "user")]
     (println "Op:" op "Id:" id "Session:" session "Ns:" ns-name)
-    (cond
-      # nREPL 'clone' - used to start a new session
-      (= op "clone")
-      (let [response (phel->php {"new-session" session "id" id "status" ["done"]})
-            encoded (php/:: Bencode (encode response))]
-        (println "Sending clone response, encoded:" encoded)
-        (php/-> connection (write encoded)))
-
-      # describe - server capabilities
-      (= op "describe")
-      (let [response (phel->php {"id" id 
-                              "session" session
-                              "ops" {"clone" {} "describe" {} "eval" {} "close" {} "info" {} "complete" {} "load-file" {} "ls-sessions" {}}
-                              "versions" {"phel" {"major" "0" "minor" "31"}}
-                              "status" ["done"]})]
-        (println "Sending describe response")
-        (send-response connection response))
-
-      # info - symbol info (CIDER)
-      (= op "info")
-      (send-response connection (phel->php {"id" id "session" session "status" ["done" "no-info"]}))
-
-      # complete - auto-completion (CIDER)
-      (= op "complete")
-      (send-response connection (phel->php {"id" id "session" session "completions" [] "status" ["done"]}))
-
-      # load-file - load and evaluate a file
-      (= op "load-file")
-      (let [file-content (get msg "file")]
-        (println "Loading file...")
-        (evaluate file-content ns-name connection id session))
-
-      # eval - evaluate code
-      (= op "eval")
-      (let [code (get msg "code")]
-        (println "Evaluating:" code)
-        (evaluate code ns-name connection id session))
-
-      # ls-sessions
-      (= op "ls-sessions")
-      (send-response connection (phel->php {"id" id "session" session "sessions" [session] "status" ["done"]}))
-
-      # close - close session
-      (= op "close")
-      (do
-        (println "Closing session")
-        (send-response connection (phel->php {"id" id "session" session "status" ["done" "session-closed"]})))
-      
-      # Fallback for unknown ops
-      :else
-      (do
-        (println "Unknown op:" op)
-        (send-response connection (phel->php {"id" id "session" session "status" ["done" "error" "unknown-op"]}))))))
+    (handle-op op connection id session ns-name msg)))
 
 (defn start-server [host port]
   (init-repl-helpers)  # Initialize REPL helpers for the user namespace
