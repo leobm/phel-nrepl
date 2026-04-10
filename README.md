@@ -138,19 +138,41 @@ The server supports common Phel REPL operations:
 
 ### Supported nREPL Operations
 
-| Operation     | Status      |
-|---------------|-------------|
-| `clone`       | supported   |
-| `describe`    | supported   |
-| `eval`        | supported   |
-| `load-file`   | supported   |
-| `close`       | supported   |
-| `ls-sessions` | supported   |
-| `info`        | stub        |
-| `lookup`      | stub        |
-| `complete`    | stub        |
-| `completions` | stub        |
-| `interrupt`   | stub        |
+| Operation     | Status      | Description |
+|---------------|-------------|-------------|
+| `clone`       | supported   | Create a new session |
+| `describe`    | supported   | Server capabilities and version info |
+| `eval`        | supported   | Evaluate Phel code |
+| `load-file`   | supported   | Evaluate a file's contents |
+| `close`       | supported   | Close a session |
+| `ls-sessions` | supported   | List active sessions |
+| `info`        | supported   | Symbol info (doc, arglists, file, line) |
+| `lookup`      | supported   | Symbol lookup (same as info) |
+| `complete`    | supported   | Code completion |
+| `completions` | supported   | Code completion (alias) |
+| `interrupt`   | supported   | Interrupt (session-idle) |
+
+### Code Completion
+
+The `complete`/`completions` ops provide context-aware completions:
+
+- **Alias completions** — Type `json/` to see functions from an aliased namespace
+- **Fully-qualified namespace completions** — Type `phel\json/` to see functions from that namespace
+- **PHP interop** — Type `php/` to complete PHP built-in functions and classes
+- **Current namespace** — Symbols defined in the current namespace
+- **phel\core** — All public core functions (e.g. `map`, `filter`, `reduce`)
+- **Namespace candidates** — Available namespace aliases and fully-qualified namespace names
+
+### Symbol Info / Lookup
+
+The `info` and `lookup` ops return metadata for a given symbol:
+
+- **Documentation** (`doc`) — The function's docstring
+- **Argument list** (`arglists`) — Function parameters
+- **Source location** (`file`, `line`, `column`) — Where the symbol is defined
+- **Namespace** (`ns`) and **name** — Fully resolved symbol identity
+
+Supports aliased symbols (e.g. `json/decode`), current-namespace symbols, and falls back to `phel\core`.
 
 ## Architecture
 
