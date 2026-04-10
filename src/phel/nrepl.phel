@@ -238,6 +238,9 @@
     (handle-op op connection id session ns-name msg)))
 
 (defn start-server [host port]
+  # Enable REPL mode so that symbols can be redefined (defn, def, etc.)
+  (let [registry (php/:: Registry (getInstance))]
+    (php/-> registry (addDefinition "phel\\core" "*repl-mode*" true)))
   (init-repl-helpers)  # Initialize REPL helpers for the user namespace
   (let [loop (php/:: Loop (get))]
     (let [server (php/new TcpServer (str host ":" port) loop)]

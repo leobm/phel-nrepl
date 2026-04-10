@@ -472,6 +472,17 @@ class NreplTests
             $this->assertContains('unknown-op', $response['status']);
         });
 
+        // Redefine defn (repl-mode)
+        $this->test('eval defn redefinition', function () {
+            $this->client->eval('(defn my-redef-fn [a b] (+ a b))');
+            $r1 = $this->client->eval('(my-redef-fn 1 2)');
+            $this->assertEquals('3', $r1['value']);
+            // Redefine with different body
+            $this->client->eval('(defn my-redef-fn [a b] (+ a b 10))');
+            $r2 = $this->client->eval('(my-redef-fn 1 2)');
+            $this->assertEquals('13', $r2['value']);
+        });
+
         // Close operation
         $this->test('close operation', function () {
             $response = $this->client->close();
