@@ -44,6 +44,15 @@ register_shutdown_function(function () use ($portFile) {
 
 use Gacela\Framework\Gacela;
 use Phel\Phel;
+use Phel\Lang\Registry;
+use Phel\Run\RunFacade;
 
 Gacela::bootstrap($projectRoot, Phel::configFn());
-Phel::run($projectRoot, 'PhelNrepl\Server');
+
+// Load the nREPL namespace (defines functions but does not auto-start)
+$runFacade = new RunFacade();
+$runFacade->runNamespace('PhelNrepl\\Server');
+
+// Call start-server from PHP via the Registry
+$startServer = Registry::getInstance()->getDefinition('PhelNrepl\\Server', 'start-server');
+$startServer('127.0.0.1', 7888);

@@ -1,0 +1,481 @@
+(ns phel\repl
+  (:use Phel)
+  (:use Phel\Lang\Symbol)
+  (:use Phel\Build\BuildFacade)
+  (:use Phel\Command\CommandFacade)
+  (:use Phel\Compiler\Application\Munge)
+  (:use Phel\Compiler\CompilerFacade)
+  (:use Phel\Compiler\Infrastructure\CompileOptions)
+  (:use Phel\Compiler\Infrastructure\GlobalEnvironmentSingleton)
+  (:use Phel\Compiler\Domain\Analyzer\Environment\NodeEnvironment)
+  (:use Phel\Lang\FnInterface)
+  (:use Phel\Printer\Printer)
+  (:require phel\test :as t))
+
+(def build-facade (php/new BuildFacade))
+
+(def- src-dirs (php/array)) ; Set by ReplCommand; lazily resolved via get-src-dirs
+
+(defn- get-global-env []
+  (php/:: GlobalEnvironmentSingleton (getInstance)))
+
+(defn loaded-namespaces
+  "Returns all namespaces currently loaded in the REPL."
+  {:example "(loaded-namespaces) ; => [\"phel\\core\" \"phel\\repl\"]"}
+  []
+  (php/:: Phel (getNamespaces)))
+
+(defn ns-list
+  "Returns a sorted vector of all loaded namespace names, decoded to
+  human-readable form (hyphens restored instead of underscores)."
+  {:example "(ns-list) ; => [\"phel\\core\" \"phel\\repl\" ...]"
+   :see-also ["loaded-namespaces" "dir" "ns-publics"]}
+  []
+  (let [munge (php/new Munge)]
+    (sort (for [ns :in (loaded-namespaces)]
+            (php/-> munge (decodeNs ns))))))
+
+(defn- eval-file [file]
+  (php/-> build-facade (evalFile file)))
+
+(defn- get-src-dirs
+  "Returns source directories for namespace resolution. Falls back to
+  CommandFacade when src-dirs has not been initialized (e.g. outside vanilla REPL)."
+  []
+  (if (not (php/empty src-dirs))
+    src-dirs
+    (let [dirs (php/-> (php/new CommandFacade) (getAllPhelDirectories))
+          cwd (php/getcwd)]
+      (when cwd
+        (php/array_push dirs cwd))
+      dirs)))
+
+(defn- eval-namespace [namespace]
+  (let [dependencies (php/-> build-facade (getDependenciesForNamespace (get-src-dirs) (php/array namespace)))]
+    (foreach [dep dependencies]
+      (when-not (php/in_array (php/-> dep (getNamespace)) (loaded-namespaces))
+        (eval-file (php/-> dep (getFile)))))))
+
+(defn resolve
+  "Resolves the given symbol in the current environment and returns a resolved Symbol with the absolute namespace or nil if it cannot be resolved."
+  {:example "(resolve 'map) ; => phel\\core/map"}
+  [sym]
+  (-> (get-global-env)
+      (php/-> (resolveAsSymbol sym (php/:: NodeEnvironment (empty))))))
+
+(defn- clean-doc [str]
+  (php/trim (php/str_replace (php/array "```phel\n" "```") "" str)))
+
+(defn- find-doc [namespace name]
+  (let [meta (php/:: Phel (getDefinitionMetaData namespace name))]
+    (when meta
+      (let [doc (or (get meta :doc) "")
+            deprecated (get meta :deprecated)
+            message (if deprecated
+                      (str doc (if (= doc "") "" "\n") "DEPRECATED: " deprecated)
+                      doc)]
+        (clean-doc message)))))
+
+(defmacro doc
+  "Prints the documentation for the given symbol."
+  {:example "(doc map)"}
+  [sym]
+  (let [resolved-sym (resolve sym)]
+    (when resolved-sym
+      `(println (find-doc ,(namespace resolved-sym) ,(name resolved-sym))))))
+
+(defn- extract-alias [sym options]
+  (if (:as options)
+    (:as options)
+    (let [parts (php/explode "\\" (name sym))
+          last (php/array_pop parts)]
+      (php/:: Symbol (create last)))))
+
+(defn- set-ns [namespace]
+  (set-var *ns* namespace))
+
+(defn- require-namespace
+  [namespace alias refers]
+  (let [env (get-global-env)
+        current-ns *ns*]
+    (php/-> env (addRequireAlias current-ns alias namespace))
+    (foreach [r refers]
+      (php/-> env (addRefer current-ns r namespace)))
+    (eval-namespace namespace)
+    (php/-> (get-global-env) (setNs current-ns))
+    (set-ns current-ns)
+    namespace))
+
+(defmacro require
+  "Requires a Phel module into the environment."
+  {:example "(require phel\http :as http :refer [request]) ; => phel\\http"}
+  [sym & args]
+  (let [options (apply hash-map args)
+        alias (extract-alias sym options)
+        refers (or (:refer options) [])]
+    `(require-namespace ',sym ',alias ',refers)))
+
+(defn- use-namespace
+  [namespace alias]
+  (php/-> (get-global-env) (addUseAlias *ns* alias namespace))
+  namespace)
+
+(defmacro use
+  "Adds a use statement to the environment."
+  {:example "(use DateTime :as DT) ; => DateTime"}
+  [sym & args]
+  (let [options (apply hash-map args)
+        alias (extract-alias sym options)]
+    `(use-namespace ',sym ',alias)))
+
+(defn- print-colorful-str
+  "Same as print-str from core, but with color."
+  [& xs]
+  (let [len (count xs)
+        printer (php/:: Printer (readableWithColor))
+        pp |(php/-> printer (print $))]
+    (case (count xs)
+      0 ""
+      1 (pp (first xs))
+      (loop [res (pp (first xs))
+             seq (next xs)]
+        (if seq
+          (recur (str res " " (pp (first seq))) (next seq))
+          res)))))
+
+(defn print-colorful
+  "Prints arguments with colored output."
+  {:example "(print-colorful [1 2 3])"}
+  [& xs]
+  (php/print (apply print-colorful-str xs))
+  nil)
+
+(defn println-colorful
+  "Prints arguments with colored output followed by a newline."
+  {:example "(println-colorful [1 2 3])"}
+  [& xs]
+  (apply print-colorful xs)
+  (php/print "\n")
+  nil)
+
+(defn compile-str
+  "Compiles a Phel expression string to PHP code."
+  {:example "(compile-str \"(+ 1 2)\") ; => \"(1 + 2)\""}
+  [s]
+  (let [cf (php/new CompilerFacade)
+        opts (php/new CompileOptions)
+        res (php/-> cf (compile s opts))]
+    (php/-> res (getCode))))
+
+(defn eval-str
+  "Evaluates a string of Phel code and returns the result.
+  If the string contains multiple expressions, returns the result of the last one."
+  {:example "(eval-str \"(+ 1 2)\") ; => 3"
+   :see-also ["compile-str" "load-file"]}
+  [s]
+  (let [cf (php/new CompilerFacade)
+        opts (php/new CompileOptions)]
+    (php/-> cf (eval s opts))))
+
+(defn load-file
+  "Loads and evaluates a Phel source file in the current REPL session.
+  Reads the file content and evaluates it using the compiler, preserving
+  the current REPL namespace context. Returns the result of the last expression."
+  {:example "(load-file \"src/my-module.phel\")"}
+  [path]
+  (let [content (php/file_get_contents path)]
+    (when content
+      (let [cf (php/new CompilerFacade)
+            opts (php/-> (php/new CompileOptions) (setSource path))]
+        (php/-> cf (eval content opts))))))
+
+(defn- munge-ns
+  "Encodes a namespace string for registry lookup."
+  [ns-str]
+  (let [munge (php/new Munge)]
+    (php/-> munge (encodeNs ns-str))))
+
+(defn get-symbol-info
+  "Returns a hash-map of structured metadata for the definition identified by
+  namespace and name strings. Returns nil if no such definition exists.
+
+  Keys: :doc, :file, :line, :column, :end-line, :end-column, :private,
+        :deprecated, :min-arity, :max-arity, :is-variadic, :ns, :name"
+  {:example "(get-symbol-info \"phel\\core\" \"map\")"}
+  [ns-str name-str]
+  (let [encoded-ns (munge-ns ns-str)
+        munge (php/new Munge)
+        encoded-name (php/-> munge (encode name-str))
+        meta (php/:: Phel (getDefinitionMetaData encoded-ns encoded-name))]
+    (when meta
+      (let [start-loc (get meta :start-location)
+            end-loc (get meta :end-location)]
+        {:doc (get meta :doc)
+         :file (when start-loc (get start-loc :file))
+         :line (when start-loc (get start-loc :line))
+         :column (when start-loc (get start-loc :column))
+         :end-line (when end-loc (get end-loc :line))
+         :end-column (when end-loc (get end-loc :column))
+         :private (or (get meta :private) false)
+         :deprecated (get meta :deprecated)
+         :min-arity (get meta "min-arity")
+         :max-arity (get meta "max-arity")
+         :is-variadic (or (get meta "is-variadic") false)
+         :ns ns-str
+         :name name-str}))))
+
+(defmacro symbol-info
+  "Returns a hash-map of structured metadata for the given symbol, or nil if
+  the symbol cannot be resolved.
+
+  Keys: :doc, :file, :line, :column, :end-line, :end-column, :private,
+        :deprecated, :min-arity, :max-arity, :is-variadic, :ns, :name"
+  {:example "(symbol-info map) ; => {:doc \"...\" :ns \"phel\\core\" :name \"map\" ...}"
+   :see-also ["doc" "dir" "apropos"]}
+  [sym]
+  (let [resolved-sym (resolve sym)]
+    (when resolved-sym
+      `(get-symbol-info ,(namespace resolved-sym) ,(name resolved-sym)))))
+
+(defn dir
+  "Prints all public definitions in the given namespace string.
+
+  Returns nil. Prints one name per line, sorted alphabetically."
+  {:example "(dir \"phel\\core\")"}
+  [ns-str]
+  (let [encoded (munge-ns ns-str)
+        defs (php/:: Phel (getDefinitionInNamespace encoded))
+        munge (php/new Munge)
+        names (for [fn-name :keys defs
+                    :let [meta (php/:: Phel (getDefinitionMetaData encoded fn-name))]
+                    :when (not (get meta :private))]
+                (php/-> munge (decodeNs fn-name)))]
+    (foreach [n (sort names)]
+      (println n))
+    nil))
+
+(defn apropos
+  "Returns a vector of symbols whose name contains the given search string.
+  Searches across all loaded namespaces."
+  {:example "(apropos \"map\") ; => [phel\\core/flat-map phel\\core/map ...]"}
+  [search]
+  (let [munge (php/new Munge)
+        results (transient [])]
+    (foreach [ns (loaded-namespaces)]
+      (let [defs (php/:: Phel (getDefinitionInNamespace ns))
+            fn-names (php/array_keys defs)]
+        (foreach [fn-name fn-names]
+          (let [decoded (php/-> munge (decodeNs fn-name))
+                meta (php/:: Phel (getDefinitionMetaData ns fn-name))]
+            (when (and (not (get meta :private))
+                       (php/str_contains decoded search))
+              (conj results (str (php/-> munge (decodeNs ns)) "/" decoded)))))))
+    (sort (persistent results))))
+
+(defn find-fn
+  "Searches for functions whose name or docstring contains the search string.
+  Returns a vector of maps with :ns, :name, :doc, :private, :min-arity, :max-arity, :is-variadic."
+  {:example "(find-fn \"map\") ; => [{:ns \"phel\\core\" :name \"map\" ...} ...]"
+   :see-also ["apropos" "search-doc" "get-symbol-info"]}
+  [search]
+  (let [munge (php/new Munge)
+        search-lower (php/strtolower search)
+        results (transient [])]
+    (foreach [ns (loaded-namespaces)]
+      (let [defs (php/:: Phel (getDefinitionInNamespace ns))
+            fn-names (php/array_keys defs)]
+        (foreach [fn-name fn-names]
+          (let [definition (php/:: Phel (getDefinition ns fn-name))]
+            (when (php/instanceof definition FnInterface)
+              (let [meta (php/:: Phel (getDefinitionMetaData ns fn-name))
+                    decoded-name (php/-> munge (decodeNs fn-name))
+                    decoded-ns (php/-> munge (decodeNs ns))
+                    doc (or (get meta :doc) "")
+                    name-lower (php/strtolower decoded-name)
+                    doc-lower (php/strtolower doc)]
+                (when (or (php/str_contains name-lower search-lower)
+                          (php/str_contains doc-lower search-lower))
+                  (conj results {:ns decoded-ns
+                                 :name decoded-name
+                                 :doc doc
+                                 :private (or (get meta :private) false)
+                                 :min-arity (get meta "min-arity")
+                                 :max-arity (get meta "max-arity")
+                                 :is-variadic (or (get meta "is-variadic") false)}))))))))
+    (persistent results)))
+
+(defn get-source-code
+  "Returns the source code of the definition identified by namespace and name
+  strings, or nil if the source file cannot be found or metadata is missing."
+  {:example "(get-source-code \"phel\\core\" \"map\")"
+   :see-also ["source" "get-symbol-info"]}
+  [ns-str name-str]
+  (let [info (get-symbol-info ns-str name-str)]
+    (when info
+      (let [file (get info :file)
+            start-line (get info :line)
+            end-line (get info :end-line)]
+        (when (and file start-line end-line (php/file_exists file))
+          (let [content (php/file_get_contents file)
+                lines (php/explode "\n" content)
+                extracted (php/array_slice lines (php/- start-line 1) (php/+ (php/- end-line start-line) 1))]
+            (php/implode "\n" extracted)))))))
+
+(defmacro source
+  "Returns the source code of the given symbol as a string, or nil if unavailable."
+  {:example "(source map)"
+   :see-also ["doc" "symbol-info"]}
+  [sym]
+  (let [resolved-sym (resolve sym)]
+    (when resolved-sym
+      `(get-source-code ,(namespace resolved-sym) ,(name resolved-sym)))))
+
+(defn ns-publics
+  "Returns a hash-map of {name => value} for all public definitions in the
+  given namespace string. Private definitions are excluded."
+  {:example "(ns-publics \"phel\\core\") ; => {\"map\" <fn> \"filter\" <fn> ...}"
+   :see-also ["ns-aliases" "ns-refers" "dir" "loaded-namespaces"]}
+  [ns-str]
+  (let [encoded (munge-ns ns-str)
+        defs (php/:: Phel (getDefinitionInNamespace encoded))
+        munge (php/new Munge)
+        result (transient {})]
+    (foreach [fn-name value defs]
+      (let [meta (php/:: Phel (getDefinitionMetaData encoded fn-name))]
+        (when-not (get meta :private)
+          (put result (php/-> munge (decodeNs fn-name)) value))))
+    (persistent result)))
+
+(defn ns-aliases
+  "Returns a hash-map of {alias => namespace} for all require aliases in the
+  given namespace string."
+  {:example "(ns-aliases *ns*) ; => {\"repl\" \"phel\\repl\" ...}"
+   :see-also ["ns-publics" "ns-refers" "loaded-namespaces"]}
+  [ns-str]
+  (let [env (get-global-env)
+        aliases (php/-> env (getRequireAliases ns-str))
+        result (transient {})]
+    (foreach [alias-name target-sym aliases]
+      (put result alias-name (php/-> target-sym (getName))))
+    (persistent result)))
+
+(defn ns-refers
+  "Returns a hash-map of {name => source-namespace} for all referred symbols
+  in the given namespace string."
+  {:example "(ns-refers *ns*) ; => {\"doc\" \"phel\\repl\" ...}"
+   :see-also ["ns-publics" "ns-aliases" "loaded-namespaces"]}
+  [ns-str]
+  (let [env (get-global-env)
+        refers (php/-> env (getRefers ns-str))
+        result (transient {})]
+    (foreach [refer-name source-sym refers]
+      (put result refer-name (php/-> source-sym (getName))))
+    (persistent result)))
+
+(defn search-doc
+  "Searches docstrings across all loaded namespaces for the given string.
+  Prints matching function names and their documentation."
+  {:example "(search-doc \"reduce\")"}
+  [search]
+  (let [munge (php/new Munge)
+        search-lower (php/strtolower search)]
+    (foreach [ns (loaded-namespaces)]
+      (let [defs (php/:: Phel (getDefinitionInNamespace ns))
+            fn-names (php/array_keys defs)]
+        (foreach [fn-name fn-names]
+          (let [meta (php/:: Phel (getDefinitionMetaData ns fn-name))]
+            (when meta
+              (let [doc (or (get meta :doc) "")
+                    doc-lower (php/strtolower doc)
+                    decoded-name (php/-> munge (decodeNs fn-name))
+                    decoded-ns (php/-> munge (decodeNs ns))]
+                (when (and (not (get meta :private))
+                           (php/str_contains doc-lower search-lower))
+                  (println (str "--- " decoded-ns "/" decoded-name " ---"))
+                  (println (clean-doc doc))
+                  (println))))))))
+    nil))
+
+(defn eval-capturing
+  "Evaluates a string of Phel code while capturing stdout. Returns a hash-map
+  with :value (the result), :out (captured stdout), :success (boolean), and
+  :error (error message or nil).
+
+  Useful for nREPL and other tooling that needs to separate printed output from
+  return values."
+  {:example "(eval-capturing \"(do (println \\\"hello\\\") 42)\") ; => {:value 42 :out \"hello\\n\" :success true :error nil}"
+   :see-also ["compile-str" "load-file"]}
+  [code-str]
+  (php/ob_start)
+  (try
+    (let [cf (php/new CompilerFacade)
+          opts (php/new CompileOptions)
+          value (php/-> cf (eval code-str opts))
+          out (php/ob_get_clean)]
+      {:value value
+       :out out
+       :success true
+       :error nil})
+    (catch \Throwable e
+      (let [out (php/ob_get_clean)]
+        {:value nil
+         :out out
+         :success false
+         :error (php/-> e (getMessage))}))))
+
+(defn test-ns
+  "Runs all tests in a given namespace from the REPL.
+  Requires the namespace if not already loaded, finds all deftest definitions,
+  runs them, prints results, and returns a hash-map with :pass, :fail, and :error counts.
+  Preserves outer test state so it can be safely called during a test run."
+  {:example "(test-ns \"phel-test\\test\\core\")"
+   :see-also ["dir" "loaded-namespaces"]}
+  [ns-str]
+  (eval-namespace ns-str)
+  (let [saved-stats (t/get-stats)]
+    (t/reset-stats)
+    (let [sym (php/:: Symbol (create ns-str))]
+      (t/run-tests {} sym)
+      (let [{:counts counts} (t/get-stats)
+            result {:pass (get counts :pass)
+                    :fail (get counts :failed)
+                    :error (get counts :error)}]
+        (t/restore-stats saved-stats)
+        result))))
+
+(defn macroexpand-1-form
+  "Expands the given form once if it is a macro call.
+  Takes a quoted form and returns the expanded form, or the original
+  form unchanged if it is not a macro call. Uses the CompilerFacade
+  to perform the expansion without going through analyze+emit."
+  {:example "(macroexpand-1-form '(defn foo [x] x))"
+   :see-also ["macroexpand-form" "macroexpand-1" "macroexpand"]}
+  [form]
+  (let [cf (php/new CompilerFacade)]
+    (php/-> cf (macroexpand1 form))))
+
+(defn macroexpand-form
+  "Recursively expands the given form until it is no longer a macro call.
+  Takes a quoted form and returns the fully expanded form. Uses the
+  CompilerFacade to perform the expansion without going through analyze+emit."
+  {:example "(macroexpand-form '(defn foo [x] x))"
+   :see-also ["macroexpand-1-form" "macroexpand-1" "macroexpand"]}
+  [form]
+  (let [cf (php/new CompilerFacade)]
+    (php/-> cf (macroexpand form))))
+
+(defmacro macroexpand-1
+  "Expands the given form once. The form is automatically quoted.
+  Returns the expanded form, or the original if it is not a macro call."
+  {:example "(macroexpand-1 (defn foo [x] x))"
+   :see-also ["macroexpand" "macroexpand-1-form" "macroexpand-form"]}
+  [form]
+  `(macroexpand-1-form ',form))
+
+(defmacro macroexpand
+  "Recursively expands the given form until it is no longer a macro call.
+  The form is automatically quoted. Returns the fully expanded form."
+  {:example "(macroexpand (defn foo [x] x))"
+   :see-also ["macroexpand-1" "macroexpand-1-form" "macroexpand-form"]}
+  [form]
+  `(macroexpand-form ',form))

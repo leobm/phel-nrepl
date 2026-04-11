@@ -1,11 +1,17 @@
 (ns test
-  (:require phel\json :as json))
+  (:require phel\json)
+  (:require phel\html :as h)
+  (:require phel\debug))
+
 
 (+ 1 1)
-
 (* 10 10)
 
-(+ 2 21)
+
+(h/html 
+ [:div
+    [:h1 {:class "test"} "felix"
+         ]])
 
 (def d (php/new \DateTime))
 (php/-> d (getTimestamp))
@@ -23,5 +29,5 @@
 (source filter)
 
 
-;; killt rprocess für port
+;; killt process für port
 ;lsof -ti:7888 | xargs kill -9 2>/dev/null; sleep 1

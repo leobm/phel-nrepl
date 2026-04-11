@@ -436,6 +436,3 @@
       # Standard nREPL banner - Calva Jack-in scans stdout for this exact format
       (println (str "nREPL server started on port " port " on host " host " - nrepl://" host ":" port))
       (php/-> loop (run)))))
-
-# Start the server
-(start-server "127.0.0.1" 7888)
