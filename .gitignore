@@ -1,5 +1,6 @@
 /vendor/
 /data/
+/out/
 composer.lock
 .calva/
 .clj-kondo/.cache
