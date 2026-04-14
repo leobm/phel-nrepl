@@ -5,19 +5,23 @@ declare(strict_types=1);
 
 error_reporting(E_ALL & ~E_DEPRECATED);
 
-// Find the autoloader by walking up the directory tree
-// Works when run from package root, as a Composer dependency (symlinked or copied)
-$dir = __DIR__;
-$autoloader = null;
-for ($i = 0; $i < 10; $i++) {
-    $candidate = $dir . '/vendor/autoload.php';
-    if (file_exists($candidate)) {
-        // Prefer the topmost project autoloader when symlinked
-        $autoloader = realpath($candidate);
+// Find the autoloader:
+// 1. Use Composer's bin proxy autoload path if available (symlinked path repos)
+// 2. Otherwise walk up the directory tree
+if (!empty($GLOBALS['_composer_autoload_path']) && file_exists($GLOBALS['_composer_autoload_path'])) {
+    $autoloader = realpath($GLOBALS['_composer_autoload_path']);
+} else {
+    $dir = __DIR__;
+    $autoloader = null;
+    for ($i = 0; $i < 10; $i++) {
+        $candidate = $dir . '/vendor/autoload.php';
+        if (file_exists($candidate)) {
+            $autoloader = realpath($candidate);
+        }
+        $parent = dirname($dir);
+        if ($parent === $dir) break;
+        $dir = $parent;
     }
-    $parent = dirname($dir);
-    if ($parent === $dir) break;
-    $dir = $parent;
 }
 
 if ($autoloader === null) {
