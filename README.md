@@ -17,7 +17,7 @@ This package is not yet on Packagist. Add the GitHub repository to your `compose
 ```json
 {
     "require": {
-        "phel-lang/phel-nrepl": "dev-main"
+        "leobm/phel-nrepl": "dev-main"
     },
     "repositories": [
         {
@@ -37,7 +37,7 @@ composer update
 ```
 
 <!-- Once published on Packagist, this will be enough:
-composer require phel-lang/phel-nrepl
+composer require leobm/phel-nrepl
 -->
 
 ### Standalone (for development)
